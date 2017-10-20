@@ -1,7 +1,7 @@
 import multiprocessing
 import time
 import random
-
+import queue
 
 class Producer(multiprocessing.Process):
     def __init__(self, taskQueue, ingredientQueue, numConsumers):
@@ -16,10 +16,6 @@ class Producer(multiprocessing.Process):
             self.taskQueue.put(task)
             print("[Producer %d] Produced task %d" % (self.pid, task))
         # to here.
-
-        # At last, put poison pills to stop consumers working.
-        for _ in range(self.numConsumers):
-            self.taskQueue.put(None)
 
         print("[Producer %d] ===== Produced all tasks. =====" % self.pid)
 
@@ -39,40 +35,48 @@ class Producer(multiprocessing.Process):
 
 
 class Consumer(multiprocessing.Process):
-    def __init__(self, taskQueue, resultQueue):
+    def __init__(self, taskQueue, resultQueue, poisonPillQueue):
         multiprocessing.Process.__init__(self)
         self.taskQueue = taskQueue
         self.resultQueue = resultQueue
+        self.poisonPillQueue = poisonPillQueue
 
     def run(self):
         while True:
-            task = self.taskQueue.get()
+            try:
+                poisonPill = self.poisonPillQueue.get(block=False)
+                if poisonPill is None:
+                    print(' ' * 35 + "[Consumer %d] Consumed poison pill. Terminating..." % self.pid)
+                    self.poisonPillQueue.task_done()
+                    break
 
-            # If consumer has met poison pill, stop working.
-            if task is None:
-                self.taskQueue.task_done()
-                print(' ' * 35 + "[Consumer %d] Consumed poison pill. Terminating..." % self.pid)
-                break
+            except queue.Empty:
+                task = self.taskQueue.get()
 
-            # Do some work from here
-            time.sleep(random.random() * 2)  # Pretend to take some time to process task.
-            self.taskQueue.task_done()  # Indicate the task is done so that taskQueue.join() does not block.
-            print(' ' * 35 + "[Consumer %d] Processed task %d." % (self.pid, task))
-            # to here.
-    
+                # If consumer has met poison pill, stop working.
+                if task is None:
+                    self.taskQueue.task_done()
+                    print(' ' * 35 + "[Consumer %d] Consumed poison pill. Terminating..." % self.pid)
+                    break
 
-class Arbiter(multiprocessing.Process):
-    def __init__(self, producers, consumers, taskQueue, maxConsumers):
-        pass
+                # Do some work from here
+                time.sleep(random.random() * 2)  # Pretend to take some time to process task.
+                self.taskQueue.task_done()  # Indicate the task is done so that taskQueue.join() does not block.
+                print(' ' * 35 + "[Consumer %d] Processed task %d." % (self.pid, task))
+                # to here.
 
-
-class WorkManager:
-    def __init__(self, ingredients, numProducers, numConsumers):
+class AdaptiveWorkManager:
+    def __init__(self, ingredients, numProducers, numConsumers, maxTasks, maxConsumers, interval=1):
         self.taskQueue = multiprocessing.JoinableQueue()
         self.ingredientQueue = self.enqueue_ingredients(ingredients, numProducers)
         self.resultQueue = multiprocessing.JoinableQueue()
+        self.poisonPillQueue = multiprocessing.JoinableQueue()
         self.producers = [Producer(self.taskQueue, self.ingredientQueue, numConsumers=numConsumers) for _ in range(numProducers)]
-        self.consumers = [Consumer(self.taskQueue, self.resultQueue) for _ in range(numConsumers)]
+        self.consumers = [Consumer(self.taskQueue, self.resultQueue, self.poisonPillQueue) for _ in range(numConsumers)]
+        self.maxConsumers = maxConsumers
+        self.maxTasks = maxTasks
+        self.interval = interval
+        # self.arbiter = Arbiter(self.producers, self.consumers, self.taskQueue, self.resultQueue, self.poisonPillQueue, maxTasks=maxTasks, maxConsumers=maxConsumers, interval=interval)
 
     def enqueue_ingredients(self, ingredients, numProducers):
         ingredientQueue = multiprocessing.JoinableQueue()
@@ -85,19 +89,51 @@ class WorkManager:
         return ingredientQueue
 
     def start(self):
+        self.start_all_()
+        self.monitor_()
+        self.join_all_()
+
+    def monitor_(self):
+        while True:
+            time.sleep(self.interval)
+
+            aliveConsumerCount = sum(consumer.is_alive() for consumer in self.consumers)
+            aliveProducerCount = sum(producer.is_alive() for producer in self.producers)
+            print(' ' * 70 + '[AdaptiveWorkManager] Total [%d alive / %d] consumers and %d tasks are there.' % (aliveConsumerCount, len(self.consumers), self.taskQueue.qsize()))
+
+            
+
+            if self.taskQueue.qsize() > self.maxTasks and len(self.consumers) < self.maxConsumers:
+                newConsumer = Consumer(self.taskQueue, self.resultQueue, self.poisonPillQueue)
+                self.consumers.append(newConsumer)
+                newConsumer.start()
+                print(' ' * 70 + '[AdaptiveWorkManager] Adding new consumer')
+
+            elif self.taskQueue.qsize() == 0:
+                if aliveProducerCount == 0:
+                    for _ in range(aliveConsumerCount):
+                        self.taskQueue.put(None)
+                    break
+
+                self.taskQueue.put(None)
+                print(' ' * 70 + '[AdaptiveWorkManager] Killing a consumer.')
+
+    def start_all_(self):
         for producer in self.producers:
             producer.start()
 
         for consumer in self.consumers:
             consumer.start()
 
+    def join_all_(self):
         self.taskQueue.join()
         self.resultQueue.join()
         self.ingredientQueue.join()
+        self.poisonPillQueue.join()
         self.taskQueue.close()
         self.resultQueue.close()
         self.ingredientQueue.close()
-
+        self.poisonPillQueue.close()
 
         for producer in self.producers:
             producer.join()
@@ -108,5 +144,5 @@ class WorkManager:
 if __name__ == '__main__':
     ingredients = range(100)
 
-    manager = WorkManager(ingredients, numProducers=4, numConsumers=2)
+    manager = AdaptiveWorkManager(ingredients, numProducers=3, numConsumers=1, maxTasks=20, maxConsumers=20, interval=0.1)
     manager.start()
