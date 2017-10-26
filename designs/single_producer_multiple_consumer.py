@@ -32,7 +32,7 @@ class Producer(multiprocessing.Process):
 
 
 class Consumer(multiprocessing.Process):
-    def __init__(self, taskQueue, resultQueue):
+    def __init__(self, taskQueue, resultQueue, aliveConsumerQueue):
         multiprocessing.Process.__init__(self)
         self.taskQueue = taskQueue
         self.resultQueue = resultQueue
@@ -51,6 +51,7 @@ class Consumer(multiprocessing.Process):
             if task is None:
                 self.taskQueue.task_done()
                 self.resultQueue.put(result)
+                self.aliveConsumerQueue.get()
                 print(' ' * 35 + "[Consumer %d] Consumed poison pill. Terminating..." % self.pid)
                 break
 
@@ -61,13 +62,33 @@ class Consumer(multiprocessing.Process):
             print(' ' * 35 + "[Consumer %d] Processed task %d." % (self.pid, task))
             # to here.
     
-        
+class Tracer(multiprocessing.Process):
+    def __init__(self, taskQueue, resultQueue, aliveConsumerQueue, interval=1):
+        multiprocessing.Process.__init__(self)
+        self.taskQueue = taskQueue
+        self.resultQueue = resultQueue
+        self.aliveConsumerQueue = aliveConsumerQueue
+
+        self.interval = interval
+
+    def run(self):
+        while True:
+            time.sleep(self.interval)
+
+            if self.aliveConsumerQueue.qsize() == 0:
+                break
+
 class WorkManager:
     def __init__(self, ingredients, numConsumers):
         self.taskQueue = multiprocessing.JoinableQueue()
         self.resultQueue = multiprocessing.JoinableQueue()
+        self.aliveConsumerQueue = multiprocessing.JoinableQueue()
+        for _ in range(numConsumers):
+            self.aliveConsumerQueue.put(None)
+
         self.producer = Producer(self.taskQueue, ingredients, numConsumers=numConsumers)
-        self.consumers = [Consumer(self.taskQueue, self.resultQueue) for _ in range(numConsumers)]
+        self.consumers = [Consumer(self.taskQueue, self.resultQueue, self.aliveConsumerQueue) for _ in range(numConsumers)]
+        self.tracer = Tracer(self.taskQueue, self.resultQueue)
 
     def start(self):
         self.producer.start()
